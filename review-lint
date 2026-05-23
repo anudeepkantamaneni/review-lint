@@ -1,0 +1,417 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# review-lint: A linter for Re:VIEW format source files.
+#
+# Checks .re files for common formatting issues and reports them
+# with file name, line number, severity, and a helpful message.
+#
+# Usage:
+#   review-lint [options] [file.re ...]
+#
+# If no files are given, all *.re files in the current directory are checked.
+#
+# Exit codes:
+#   0  No issues found
+#   1  One or more issues found
+#   2  Usage / argument error
+
+require 'optparse'
+require 'pathname'
+
+# ---------------------------------------------------------------------------
+# Rule definitions
+# Each rule is a Hash with keys:
+#   id       - short identifier string  (e.g. "RV001")
+#   severity - :error | :warning | :info
+#   desc     - one-line human-readable description
+#   check    - lambda(lines, filename) -> Array of { line:, col:, message: }
+# ---------------------------------------------------------------------------
+
+RULES = [
+  # RV001 – Unknown / misspelled block tags
+  {
+    id: 'RV001',
+    severity: :error,
+    desc: 'Unknown block tag',
+    check: lambda do |lines, _file|
+      known_blocks = %w[
+        list emlist listnum emlistnum cmd
+        image indepimage graph
+        table imgtable
+        footnote
+        lead abstract
+        quote
+        note memo tip info warning important caution notice
+        box
+        embed raw
+        tsize
+        comment
+        label
+        bibliography
+        column endcolumn
+        flushright center
+        numberless
+      ]
+      issues = []
+      lines.each_with_index do |line, i|
+        m = line.match(/^\s*\/\/([a-zA-Z_]+)/)
+        next unless m
+
+        tag = m[1]
+        unless known_blocks.include?(tag)
+          issues << { line: i + 1, col: 1,
+                      message: "Unknown block tag '//#{tag}'" }
+        end
+      end
+      issues
+    end
+  },
+
+  # RV002 – Unclosed block (//tag{ without matching //})
+  {
+    id: 'RV002',
+    severity: :error,
+    desc: 'Unclosed block tag',
+    check: lambda do |lines, _file|
+      issues = []
+      stack = []
+      lines.each_with_index do |line, i|
+        if line.match(/^\s*\/\/[a-zA-Z_]+\s*\{/)
+          stack << { line: i + 1, tag: line.strip }
+        elsif line.match(/^\s*\/\/\}/)
+          stack.pop
+        end
+      end
+      stack.each do |unclosed|
+        issues << { line: unclosed[:line], col: 1,
+                    message: "Block opened with '#{unclosed[:tag]}' is never closed" }
+      end
+      issues
+    end
+  },
+
+  # RV003 – Inline tag syntax errors  (@<tag>{...} not properly closed)
+  {
+    id: 'RV003',
+    severity: :error,
+    desc: 'Malformed inline tag (missing closing brace)',
+    check: lambda do |lines, _file|
+      issues = []
+      lines.each_with_index do |line, i|
+        # Find every @<tag>{ and verify it has a matching }
+        pos = 0
+        while (m = line.match(/@<[a-zA-Z_]+>\{/, pos))
+          start = m.begin(0)
+          # Walk forward looking for closing }
+          depth = 0
+          closed = false
+          (start...line.length).each do |j|
+            if line[j] == '{'
+              depth += 1
+            elsif line[j] == '}'
+              depth -= 1
+              if depth.zero?
+                closed = true
+                break
+              end
+            end
+          end
+          unless closed
+            issues << { line: i + 1, col: start + 1,
+                        message: "Inline tag '#{m[0]}' is not closed on this line" }
+          end
+          pos = start + 1
+        end
+      end
+      issues
+    end
+  },
+
+  # RV004 – Trailing whitespace
+  {
+    id: 'RV004',
+    severity: :warning,
+    desc: 'Trailing whitespace',
+    check: lambda do |lines, _file|
+      issues = []
+      lines.each_with_index do |line, i|
+        # Strip the newline first, then check for trailing spaces/tabs
+        stripped = line.chomp
+        if stripped =~ /[ \t]+$/
+          issues << { line: i + 1, col: stripped.rstrip.length + 1,
+                      message: 'Trailing whitespace' }
+        end
+      end
+      issues
+    end
+  },
+
+  # RV005 – Lines longer than 120 characters (informational)
+  {
+    id: 'RV005',
+    severity: :info,
+    desc: 'Line too long (> 120 characters)',
+    check: lambda do |lines, _file|
+      issues = []
+      lines.each_with_index do |line, i|
+        len = line.chomp.length
+        if len > 120
+          issues << { line: i + 1, col: 121,
+                      message: "Line is #{len} characters (limit: 120)" }
+        end
+      end
+      issues
+    end
+  },
+
+  # RV006 – Empty chapter title (= with no text)
+  {
+    id: 'RV006',
+    severity: :error,
+    desc: 'Empty chapter/section heading',
+    check: lambda do |lines, _file|
+      issues = []
+      lines.each_with_index do |line, i|
+        if line =~ /^={1,5}\s*$/
+          issues << { line: i + 1, col: 1,
+                      message: 'Heading marker with no title text' }
+        end
+      end
+      issues
+    end
+  },
+
+  # RV007 – Heading level skipped (e.g. = then ===)
+  {
+    id: 'RV007',
+    severity: :warning,
+    desc: 'Skipped heading level',
+    check: lambda do |lines, _file|
+      issues = []
+      prev_level = 0
+      lines.each_with_index do |line, i|
+        m = line.match(/^(={1,5})\s+\S/)
+        next unless m
+
+        level = m[1].length
+        if level > prev_level + 1 && prev_level.positive?
+          issues << { line: i + 1, col: 1,
+                      message: "Heading level jumped from #{prev_level} to #{level}" }
+        end
+        prev_level = level
+      end
+      issues
+    end
+  },
+
+  # RV008 – //list or //image without an ID
+  {
+    id: 'RV008',
+    severity: :warning,
+    desc: '//list or //image block missing an identifier',
+    check: lambda do |lines, _file|
+      issues = []
+      lines.each_with_index do |line, i|
+        if line =~ %r{^\s*//(list|image)\s*\[?\s*\]?\s*\{}
+          issues << { line: i + 1, col: 1,
+                      message: "'//#{$1}' block appears to be missing an ID label" }
+        end
+      end
+      issues
+    end
+  },
+
+  # RV009 – Windows-style line endings (CRLF)
+  {
+    id: 'RV009',
+    severity: :warning,
+    desc: 'Windows line endings (CRLF) detected',
+    check: lambda do |lines, _file|
+      issues = []
+      lines.each_with_index do |line, i|
+        if line.include?("\r")
+          issues << { line: i + 1, col: line.index("\r") + 1,
+                      message: 'Line uses CRLF endings; Re:VIEW expects LF' }
+          break # report once per file
+        end
+      end
+      issues
+    end
+  },
+
+  # RV010 – TODO / FIXME comments left in source
+  {
+    id: 'RV010',
+    severity: :info,
+    desc: 'TODO or FIXME comment found',
+    check: lambda do |lines, _file|
+      issues = []
+      lines.each_with_index do |line, i|
+        if line =~ /\b(TODO|FIXME)\b/i
+          issues << { line: i + 1, col: $~.begin(0) + 1,
+                      message: "Found '#{$1}' comment – remember to resolve before publishing" }
+        end
+      end
+      issues
+    end
+  }
+].freeze
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+SEVERITY_LABEL = {
+  error:   'E',
+  warning: 'W',
+  info:    'I'
+}.freeze
+
+SEVERITY_COLOR = {
+  error:   "\e[31m",  # red
+  warning: "\e[33m",  # yellow
+  info:    "\e[36m"   # cyan
+}.freeze
+
+RESET_COLOR = "\e[0m"
+
+def colorize(text, color_code, use_color)
+  use_color ? "#{color_code}#{text}#{RESET_COLOR}" : text
+end
+
+def format_issue(filename, issue, rule, use_color)
+  sev   = rule[:severity]
+  label = colorize("[#{SEVERITY_LABEL[sev]}]", SEVERITY_COLOR[sev], use_color)
+  loc   = "#{filename}:#{issue[:line]}:#{issue[:col]}"
+  "#{label} #{loc}  #{rule[:id]}  #{issue[:message]}"
+end
+
+# ---------------------------------------------------------------------------
+# Core lint logic
+# ---------------------------------------------------------------------------
+
+def lint_file(filename, enabled_rules, options)
+  unless File.exist?(filename)
+    warn "review-lint: file not found: #{filename}"
+    return []
+  end
+
+  lines = File.readlines(filename, encoding: 'utf-8')
+  issues_out = []
+
+  enabled_rules.each do |rule|
+    next if options[:ignore].include?(rule[:id])
+    next if options[:severity_filter] && rule[:severity] != options[:severity_filter]
+
+    found = rule[:check].call(lines, filename)
+    found.each do |issue|
+      issues_out << { filename: filename, issue: issue, rule: rule }
+    end
+  end
+
+  # Sort by line number
+  issues_out.sort_by { |i| i[:issue][:line] }
+end
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+options = {
+  ignore:          [],
+  color:           $stdout.tty?,
+  severity_filter: nil,
+  list_rules:      false,
+  stats:           false
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = 'Usage: review-lint [options] [file.re ...]'
+  opts.separator ''
+  opts.separator 'Options:'
+
+  opts.on('--ignore RULES', 'Comma-separated rule IDs to ignore (e.g. RV004,RV005)') do |val|
+    options[:ignore] = val.split(',').map(&:strip)
+  end
+
+  opts.on('--only SEVERITY', %w[error warning info],
+          'Show only issues of this severity (error, warning, info)') do |val|
+    options[:severity_filter] = val.to_sym
+  end
+
+  opts.on('--[no-]color', 'Force enable/disable color output') do |val|
+    options[:color] = val
+  end
+
+  opts.on('--list-rules', 'List all available rules and exit') do
+    options[:list_rules] = true
+  end
+
+  opts.on('--stats', 'Print summary statistics') do
+    options[:stats] = true
+  end
+
+  opts.on('-h', '--help', 'Show this help message and exit') do
+    puts opts
+    exit 0
+  end
+
+  opts.on('-v', '--version', 'Show version') do
+    puts 'review-lint 0.1.0'
+    exit 0
+  end
+end
+
+begin
+  parser.parse!
+rescue OptionParser::InvalidOption, OptionParser::InvalidArgument => e
+  warn "review-lint: #{e.message}"
+  exit 2
+end
+
+# --list-rules mode
+if options[:list_rules]
+  puts 'Available rules:'
+  puts format('  %-7s  %-9s  %s', 'ID', 'SEVERITY', 'DESCRIPTION')
+  puts '  ' + '-' * 50
+  RULES.each do |r|
+    puts format('  %-7s  %-9s  %s', r[:id], r[:severity].to_s, r[:desc])
+  end
+  exit 0
+end
+
+# Collect target files
+files = ARGV.empty? ? Dir.glob('*.re').sort : ARGV
+
+if files.empty?
+  warn 'review-lint: no .re files found.'
+  exit 0
+end
+
+# Run linter
+all_issues = []
+files.each do |f|
+  all_issues.concat(lint_file(f, RULES, options))
+end
+
+# Output
+all_issues.each do |entry|
+  puts format_issue(entry[:filename], entry[:issue], entry[:rule], options[:color])
+end
+
+# Stats
+if options[:stats] || all_issues.any?
+  errors   = all_issues.count { |i| i[:rule][:severity] == :error }
+  warnings = all_issues.count { |i| i[:rule][:severity] == :warning }
+  infos    = all_issues.count { |i| i[:rule][:severity] == :info }
+
+  if options[:stats]
+    puts ''
+    puts "Files checked : #{files.length}"
+    puts "Total issues  : #{all_issues.length}  " \
+         "(errors: #{errors}, warnings: #{warnings}, info: #{infos})"
+  end
+end
+
+exit(all_issues.any? { |i| i[:rule][:severity] == :error } ? 1 : 0)
